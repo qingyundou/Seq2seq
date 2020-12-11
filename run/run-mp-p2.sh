@@ -1,6 +1,11 @@
 #!/bin/bash
 #$ -S /bin/bash
 
+
+# ------------------------ MODE --------------------------
+MODE=train # train translate translate_attention
+
+
 # ------------------------ ENV --------------------------
 unset LD_PRELOAD # overwrite env
 export PATH=/home/mifs/ytl28/anaconda3/bin/:$PATH
@@ -23,18 +28,33 @@ echo "on $HOSTNAME, using gpu (no nb means cpu) $CUDA_VISIBLE_DEVICES"
 # export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt11-cuda9/bin/python3
 # qd212
 source /home/mifs/ytl28/anaconda3/etc/profile.d/conda.sh
-conda activate pt11-cuda9
-export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt11-cuda9/bin/python3
-# conda activate py13-cuda9
-# export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/py13-cuda9/bin/python3
+# conda activate pt11-cuda9
+# export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt11-cuda9/bin/python3
+conda activate py13-cuda9
+export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/py13-cuda9/bin/python3
 # conda activate pt15-cuda10
 # export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt15-cuda10/bin/python3
 
 # conda list | grep tensorboard
 # tensorboard --logdir=runs
 
-# ------------------------ MODE --------------------------
-MODE=train # train translate
+# if [[ "$MODE" == "train" ]]; then
+# 	conda activate pt15-cuda10
+# 	export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt15-cuda10/bin/python3
+# else
+# 	conda activate py13-cuda9
+# 	export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/py13-cuda9/bin/python3
+# fi
+# case $MODE in
+# "train")
+# 	conda activate pt15-cuda10
+# 	export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/pt15-cuda10/bin/python3
+# ;;
+# "translate")
+# 	conda activate py13-cuda9
+# 	export PYTHONBIN=/home/mifs/ytl28/anaconda3/envs/py13-cuda9/bin/python3
+# ;;
+# esac
 
 
 # ------------------------ DIR --------------------------
@@ -43,7 +63,9 @@ cd $EXP_DIR
 
 DATA_DIR=/home/dawna/tts/qd212/models/af
 
-savedir=results/enfr/v0010-mp-p2
+# savedir=results/enfr/v0010-mp-p2
+savedir=results/enfr/v0010-mp-p2-stable
+
 train_path_src=${DATA_DIR}/af-lib/iwslt15-enfr/iwslt15_en_fr/train.tags.en-fr.en
 train_path_tgt=${DATA_DIR}/af-lib/iwslt15-enfr/iwslt15_en_fr/train.tags.en-fr.fr
 # dev_path_src=${DATA_DIR}/af-lib/iwslt15-enfr/iwslt15_en_fr/IWSLT15.TED.tst2013.en-fr.en
@@ -76,7 +98,7 @@ print_every=1000
 batch_size=50 # 256
 max_seq_len=64 # 32
 minibatch_split=1
-num_epochs=30 # 20
+num_epochs=50 # 20
 
 random_seed=2020
 eval_with_mask=False
@@ -85,8 +107,16 @@ max_count_num_rollback=2
 keep_num=2
 normalise_loss=True
 
+# init_dir=results/enfr/v0000-tf-nodev-nomask/checkpoints_epoch/30
+# init_dir_p2=$init_dir # None
+init_dir=results/enfr/v0000-tf-nodev-nomask/checkpoints_epoch/25
+init_dir_p2=results/enfr/v0010-mp-p2/checkpoints_epoch/31
+# load_p2=results/enfr/v0010-mp-p2/checkpoints_epoch/30
+
 # ------------------------ TEST --------------------------
 # ----- data ------
+# fname=tst2013
+# ftst=${DATA_DIR}/af-lib/iwslt15-enfr/iwslt15_en_fr/IWSLT15.TED.tst2013.en-fr.en
 fname=tst2014
 ftst=${DATA_DIR}/af-lib/en-fr-2015/iwslt15_en_fr/IWSLT16.TED.tst2014.en-fr.en
 seqlen=200
@@ -94,7 +124,7 @@ seqlen=200
 # ----- models ------
 # export ckpt=$1
 model=$savedir
-# ckpt=18
+ckpt=31 # 22
 tmp=checkpoints_epoch
 # ckpt=2020_12_03_00_25_03 # 2020_12_03_02_04_53
 # tmp=checkpoints
@@ -106,7 +136,7 @@ use_gpu=True
 echo MODE: $MODE
 case $MODE in
 "train")
-	$PYTHONBIN ${EXP_DIR}/train.py \
+	$PYTHONBIN ${EXP_DIR}/train-mp-p2.py \
 		--train_path_src $train_path_src \
 		--train_path_tgt $train_path_tgt \
 		--dev_path_src $dev_path_src \
@@ -150,6 +180,10 @@ case $MODE in
 		--keep_num $keep_num \
 		--normalise_loss $normalise_loss \
 		--minibatch_split $minibatch_split \
+		--init_dir $init_dir \
+		--init_dir_p2 $init_dir_p2 \
+		# --load $init_dir \
+		# --load_p2 $load_p2
 ;;
 "translate")
 trap "exit" INT
@@ -158,14 +192,14 @@ for f in ${EXP_DIR}/$model/checkpoints_epoch/*; do
     test_path_out=$model/$fname/$ckpt/
     if [ ! -f "${test_path_out}translate.txt" ]; then
     echo MODE: translate, save to $test_path_out
-
-    $PYTHONBIN ${EXP_DIR}/translate.py \
+    $PYTHONBIN ${EXP_DIR}/translate-mp-p2.py \
         --test_path_src $ftst \
         --seqrev False \
         --path_vocab_src $path_vocab_src \
         --path_vocab_tgt $path_vocab_tgt \
         --use_type $use_type \
-        --load $model/$tmp/$ckpt \
+        --load $init_dir \
+        --load_p2 $model/$tmp/$ckpt \
         --test_path_out $test_path_out \
         --max_seq_len $seqlen \
         --batch_size $batch_size \
@@ -174,5 +208,24 @@ for f in ${EXP_DIR}/$model/checkpoints_epoch/*; do
         --eval_mode 1
     fi
 done
+;;
+"translate_attention")
+	ckpt=$ckpt
+	test_path_out=$model/$fname/$ckpt/
+	echo MODE: translate_attention, save to $test_path_out
+	$PYTHONBIN ${EXP_DIR}/translate-mp-p2.py \
+	    --test_path_src $ftst \
+	    --seqrev False \
+	    --path_vocab_src $path_vocab_src \
+	    --path_vocab_tgt $path_vocab_tgt \
+	    --use_type $use_type \
+	    --load $init_dir \
+	    --load_p2 $model/$tmp/$ckpt \
+	    --test_path_out $test_path_out \
+	    --max_seq_len $seqlen \
+	    --batch_size $batch_size \
+	    --use_gpu $use_gpu \
+	    --beam_width $beam_width \
+	    --eval_mode 3
 ;;
 esac

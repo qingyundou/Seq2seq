@@ -111,6 +111,9 @@ class EncRNN(nn.Module):
 		# import pdb; pdb.set_trace()
 		# src_lens=None
 
+		# print(src.size(), src[0][:3])
+		# print(len(src_lens), src_lens[0].size(), max(src_lens))
+
 		device = check_device(use_gpu)
 
 		# src mask
@@ -128,11 +131,18 @@ class EncRNN(nn.Module):
 			emb_src_pack = torch.nn.utils.rnn.pack_padded_sequence(emb_src,
 				src_lens, batch_first=True, enforce_sorted=False)
 			enc_outputs_pack, enc_hidden = self.enc(emb_src_pack, hidden)
+			
+			# import pdb; pdb.set_trace()
+			# print(enc_outputs_pack.size())
 			enc_outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(
 				enc_outputs_pack, batch_first=True)
+			# print(enc_outputs_pack.size())
+			# pdb.set_trace()
+
 		else:
 			enc_outputs, enc_hidden = self.enc(emb_src, hidden)
 		# unilstm
+		# print(enc_outputs.size(), batch_size, seq_len, enc_outputs.size(-1))
 		enc_outputs = self.dropout(enc_outputs)\
 			.view(batch_size, seq_len, enc_outputs.size(-1))
 

@@ -5,7 +5,7 @@
 unset LD_PRELOAD # overwrite env
 export PATH=/home/mifs/ytl28/anaconda3/bin/:$PATH
 
-AIR_FORCE_GPU=1
+AIR_FORCE_GPU=0
 export MANU_CUDA_DEVICE=0 #note on nausicaa no.2 is no.0
 # select gpu when not on air
 if [[ "$HOSTNAME" != *"air"* ]]  || [ $AIR_FORCE_GPU -eq 1 ]; then
@@ -72,7 +72,7 @@ print_every=1000
 batch_size=50 # 256
 max_seq_len=64 # 32
 minibatch_split=1
-num_epochs=30 # 20
+num_epochs=60 # 20
 
 random_seed=2020
 eval_with_mask=False
@@ -80,6 +80,8 @@ max_count_no_improve=5
 max_count_num_rollback=2
 keep_num=2
 normalise_loss=True
+
+load=$savedir/checkpoints_epoch/34
 
 $PYTHONBIN ${EXP_DIR}/train.py \
 	--train_path_src $train_path_src \
@@ -125,3 +127,4 @@ $PYTHONBIN ${EXP_DIR}/train.py \
 	--keep_num $keep_num \
 	--normalise_loss $normalise_loss \
 	--minibatch_split $minibatch_split \
+	--load $load

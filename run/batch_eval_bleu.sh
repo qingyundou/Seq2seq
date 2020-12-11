@@ -15,7 +15,7 @@ MODE=bleu # bleu diverse_train diverse_translate
 
 # 1.1 select tgt language and testset
 LANGUAGE=fr # fr de vi
-testset_fr=tst2013 # tst2013 tst2014
+testset_fr=tst2014 # tst2013 tst2014
 testset_de=tst-COMMON
 testset_vi=tst2012 # tst2012 tst2013
 
@@ -48,8 +48,12 @@ esac
 
 # 1.2 select model
 
-# indir=results/enfr/v0000-tf-nodev-nomask/${testset}
-indir=results/enfr/v0000-tf-dev-mask/${testset}
+indir=results/enfr/v0000-tf-nodev-nomask/${testset}
+# indir=results/enfr/v0000-tf-nodev-nomask-asup/${testset}
+# indir=results/enfr/v0000-tf-dev-mask/${testset}
+# indir=results/enfr/v0010-mp-p2/${testset}
+# indir=results/enfr/v0010-mp-p2-frLmax/${testset}
+
 
 
 # d_arr=(8)

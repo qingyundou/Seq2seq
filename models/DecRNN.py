@@ -15,6 +15,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 KEY_ATTN_SCORE = 'attention_score'
+KEY_ATTN_SCORE_O1 = 'attention_score_o1'
 KEY_LENGTH = 'length'
 KEY_SEQUENCE = 'sequence'
 KEY_MODEL_STRUCT = 'model_struct'
@@ -660,6 +661,437 @@ class DecRNN(nn.Module):
 		s = s.data
 
 		return output, h_t, h_n, s, l, p
+
+
+
+
+class DecRNN_pass2(DecRNN):
+	def __init__(self,
+		vocab_size_dec,
+		embedding_size_dec=200,
+		embedding_dropout=0,
+		hidden_size_enc=200,
+		hidden_size_dec=200,
+		num_unilstm_dec=2,
+		att_mode='bahdanau',
+		hidden_size_att=10,
+		hidden_size_shared=200,
+		dropout=0.0,
+		residual=False,
+		batch_first=True,
+		max_seq_len=32,
+		load_embedding_tgt=None,
+		tgt_word2id=None,
+		tgt_id2word=None
+		):
+		super().__init__(vocab_size_dec,
+			embedding_size_dec=embedding_size_dec,
+			embedding_dropout=embedding_dropout,
+			hidden_size_enc=hidden_size_enc,
+			hidden_size_dec=hidden_size_dec,
+			num_unilstm_dec=num_unilstm_dec,
+			att_mode=att_mode,
+			hidden_size_att=hidden_size_att,
+			hidden_size_shared=hidden_size_shared,
+			dropout=dropout,
+			residual=residual,
+			batch_first=batch_first,
+			max_seq_len=max_seq_len,
+			load_embedding_tgt=load_embedding_tgt,
+			tgt_word2id=tgt_word2id,
+			tgt_id2word=tgt_id2word)
+
+		# new attention over 1st pass output
+		self.att_o1 = AttentionLayer(
+			self.query_size, self.key_size, value_size=self.value_size,
+			mode=att_mode, dropout=dropout,
+			query_transform=False, output_transform=False,
+			hidden_size=self.hidden_size_att, hard_att=False)
+
+		# overwrite final dnn - adjust dim
+		self.ff_inputs_size = self.hidden_size_enc * 4 + self.hidden_size_dec
+		self.ffn = nn.Linear(self.ff_inputs_size, self.hidden_size_shared, bias=False)
+
+
+	def forward(self, enc_outputs, src, tgt=None,
+		hidden=None, is_training=False, teacher_forcing_ratio=1.0,
+		beam_width=1, use_gpu=True, enc_outputs_o1=None, output_p1=None):
+
+		"""
+			Args:
+				enc_outputs: [batch_size, max_seq_len, self.hidden_size_enc * 2]
+				tgt: list of tgt word_ids
+				hidden: initial hidden state
+				is_training: whether in eval or train mode
+				teacher_forcing_ratio: default at 1 - always teacher forcing
+			Returns:
+				decoder_outputs: list of step_output - log predicted_softmax
+					[batch_size, 1, vocab_size_dec] * (T-1)
+				ret_dict
+		"""
+
+		# import pdb; pdb.set_trace()
+
+		global device
+		device = check_device(use_gpu)
+
+		# 0. init var
+		ret_dict = dict()
+		ret_dict[KEY_ATTN_SCORE], ret_dict[KEY_ATTN_SCORE_O1] = [], []
+
+		decoder_outputs = []
+		sequence_symbols = []
+		batch_size = enc_outputs.size(0)
+
+		if type(tgt) == type(None): tgt = torch.Tensor([BOS]).repeat(
+			(batch_size, self.max_seq_len)).type(torch.LongTensor).to(device=device)
+		max_seq_len = tgt.size(1)
+		lengths = np.array([max_seq_len] * batch_size)
+
+		# 1. convert id to embedding
+		emb_tgt = self.embedding_dropout(self.embedder_dec(tgt))
+
+		# 2. att inputs: keys n values
+		mask_src, mask_src_o1 = src.data.eq(PAD), output_p1.data.eq(PAD)
+		att_keys, att_keys_o1 = enc_outputs, enc_outputs_o1
+		att_vals, att_vals_o1 = enc_outputs, enc_outputs_o1
+
+		# 3. init hidden states
+		dec_hidden = None
+
+		# decoder
+		def decode(step, step_output, step_attn_lst):
+
+			"""
+				Greedy decoding
+				Note:
+					it should generate EOS, PAD as used in training tgt
+				Args:
+					step: step idx
+					step_output: log predicted_softmax -
+						[batch_size, 1, vocab_size_dec]
+					step_attn: attention scores -
+						(batch_size x tgt_len(query_len) x src_len(key_len)
+				Returns:
+					symbols: most probable symbol_id [batch_size, 1]
+			"""
+
+			ret_dict[KEY_ATTN_SCORE].append(step_attn_lst[0])
+			ret_dict[KEY_ATTN_SCORE_O1].append(step_attn_lst[1])
+			decoder_outputs.append(step_output)
+			symbols = decoder_outputs[-1].topk(1)[1]
+			sequence_symbols.append(symbols)
+
+			eos_batches = torch.max(symbols.data.eq(EOS), symbols.data.eq(PAD))
+			# eos_batches = symbols.data.eq(PAD)
+			if eos_batches.dim() > 0:
+				eos_batches = eos_batches.cpu().view(-1).numpy()
+				update_idx = ((lengths > step) & eos_batches) != 0
+				lengths[update_idx] = len(sequence_symbols)
+
+			return symbols
+
+		# 4. run dec + att + shared + output
+		"""
+			teacher_forcing_ratio = 1.0 -> always teacher forcing
+
+			E.g.: (shift-by-1)
+			emb_tgt      = <s> w1 w2 w3 </s> <pad> <pad> <pad>   [max_seq_len]
+			tgt_chunk in = <s> w1 w2 w3 </s> <pad> <pad>         [max_seq_len - 1]
+			predicted    =     w1 w2 w3 </s> <pad> <pad> <pad>   [max_seq_len - 1]
+
+		"""
+		# import pdb; pdb.set_trace()
+		if not is_training:
+			use_teacher_forcing = False
+		elif random.random() < teacher_forcing_ratio:
+			use_teacher_forcing = True
+		else:
+			use_teacher_forcing = False
+
+		# beam search decoding
+		if not is_training and beam_width > 1:
+			decoder_outputs, decoder_hidden, metadata = \
+				self.beam_search_decoding(att_keys, att_vals,
+				dec_hidden, mask_src, beam_width=beam_width, device=device, 
+				att_keys_o1=att_keys_o1, att_vals_o1=att_vals_o1)
+			return decoder_outputs, decoder_hidden, metadata
+
+		# greedy search decoding
+		tgt_chunk = emb_tgt[:, 0].unsqueeze(1) # BOS
+		cell_value = torch.FloatTensor([0]).repeat(
+			batch_size, 1, self.hidden_size_shared).to(device=device)
+		prev_c = torch.FloatTensor([0]).repeat(
+			batch_size, 1, max_seq_len).to(device=device)
+		prev_c_o1 = prev_c
+		for idx in range(max_seq_len - 1):
+			predicted_logsoftmax, dec_hidden, step_attn_lst, c_out_lst, cell_value = \
+				self.forward_step(att_keys, att_vals, tgt_chunk,
+					cell_value, dec_hidden, mask_src, prev_c, 
+					att_keys_o1=att_keys_o1, att_vals_o1=att_vals_o1, mask_src_o1=mask_src_o1, prev_c_o1=prev_c_o1)
+			predicted_logsoftmax = predicted_logsoftmax.squeeze(1) # [b, vocab_size]
+			step_output = predicted_logsoftmax
+			symbols = decode(idx, step_output, step_attn_lst)
+			prev_c, prev_c_o1 = c_out_lst[0], c_out_lst[1]
+			if use_teacher_forcing:
+				tgt_chunk = emb_tgt[:, idx+1].unsqueeze(1)
+			else:
+				tgt_chunk = self.embedder_dec(symbols)
+
+		ret_dict[KEY_SEQUENCE] = sequence_symbols
+		ret_dict[KEY_LENGTH] = lengths.tolist()
+
+		return decoder_outputs, dec_hidden, ret_dict
+
+
+	def forward_step(self, att_keys, att_vals, tgt_chunk, prev_cell_value,
+		dec_hidden=None, mask_src=None, prev_c=None, 
+		att_keys_o1=None, att_vals_o1=None, mask_src_o1=None, prev_c_o1=None):
+
+		"""
+		manual unrolling - can only operate per time step
+
+		Args:
+			att_keys:   [batch_size, seq_len, hidden_size_enc * 2 + optional key size (key_size)]
+			att_vals:   [batch_size, seq_len, hidden_size_enc * 2 (val_size)]
+			tgt_chunk:  tgt word embeddings
+						non teacher forcing - [batch_size, 1, embedding_size_dec] (lose 1 dim when indexed)
+			prev_cell_value:
+						previous cell value before prediction [batch_size, 1, self.state_size]
+			dec_hidden:
+						initial hidden state for dec layer
+			mask_src:
+						mask of PAD for src sequences
+			prev_c:
+						used in hybrid attention mechanism
+
+		Returns:
+			predicted_softmax: log probilities [batch_size, vocab_size_dec]
+			dec_hidden: a list of hidden states of each dec layer
+			attn: attention weights
+			cell_value: transformed attention output [batch_size, 1, self.hidden_size_shared]
+		"""
+
+		# record sizes
+		batch_size = tgt_chunk.size(0)
+		tgt_chunk_etd = torch.cat([tgt_chunk, prev_cell_value], -1)
+		tgt_chunk_etd = tgt_chunk_etd.view(-1, 1, self.embedding_size_dec + self.hidden_size_shared)
+
+		# run dec
+		# default dec_hidden: [h_0, c_0];
+		# with h_0 [num_layers * num_directions(==1), batch, hidden_size]
+		if not self.residual:
+			# import pdb; pdb.set_trace()
+			# print(tgt_chunk.size(), dec_hidden.size())
+
+			dec_outputs, dec_hidden = self.dec(tgt_chunk, dec_hidden)
+			dec_outputs = self.dropout(dec_outputs)
+		else:
+			# store states layer by -
+			# layer num_layers * ([1, batch, hidden_size], [1, batch, hidden_size])
+			dec_hidden_lis = []
+
+			# layer0
+			dec_func_first = getattr(self.dec, 'l0')
+			if type(dec_hidden) == type(None):
+				dec_outputs, dec_hidden_out = dec_func_first(tgt_chunk_etd, None)
+			else:
+				index = torch.tensor([0]).to(device=device) # choose the 0th layer
+				dec_hidden_in = tuple([h.index_select(dim=0, index=index) for h in dec_hidden])
+				dec_outputs, dec_hidden_out = dec_func_first(tgt_chunk_etd, dec_hidden_in)
+			dec_hidden_lis.append(dec_hidden_out)
+
+			# no residual for 0th layer
+			dec_outputs = self.dropout(dec_outputs)
+
+			# layer1+
+			for i in range(1, self.num_unilstm_dec):
+				dec_inputs = dec_outputs
+				dec_func = getattr(self.dec, 'l'+str(i))
+				if type(dec_hidden) == type(None):
+					dec_outputs, dec_hidden_out = dec_func(dec_inputs, None)
+				else:
+					index = torch.tensor([i]).to(device=device)
+					dec_hidden_in = tuple([h.index_select(dim=0, index=index) for h in dec_hidden])
+					dec_outputs, dec_hidden_out = dec_func(dec_inputs, dec_hidden_in)
+				dec_hidden_lis.append(dec_hidden_out)
+				if i < self.num_unilstm_dec - 1:
+					dec_outputs = dec_outputs + dec_inputs
+				dec_outputs = self.dropout(dec_outputs)
+
+			# convert to tuple
+			h_0 = torch.cat([h[0] for h in dec_hidden_lis], 0)
+			c_0 = torch.cat([h[1] for h in dec_hidden_lis], 0)
+			dec_hidden = tuple([h_0, c_0])
+
+		# run att
+		self.att.set_mask(mask_src)
+		att_outputs, attn, c_out = self.att(dec_outputs, att_keys, att_vals, prev_c=prev_c)
+		att_outputs = self.dropout(att_outputs)
+
+		# import pdb; pdb.set_trace()
+		# print(mask_src.size(), dec_outputs.size(), att_keys.size(), att_vals.size(), prev_c.size())
+		# print(mask_src_o1.size(), dec_outputs.size(), att_keys_o1.size(), att_vals_o1.size(), prev_c_o1.size())
+
+		self.att_o1.set_mask(mask_src_o1)
+		att_outputs_o1, attn_o1, c_out_o1 = self.att_o1(dec_outputs, att_keys_o1, att_vals_o1, prev_c=prev_c_o1)
+		att_outputs_o1 = self.dropout(att_outputs_o1)
+
+		# run ff + softmax
+		ff_inputs = torch.cat((att_outputs, att_outputs_o1, dec_outputs), dim=-1)
+		cell_value = self.ffn(ff_inputs.view(-1, 1, self.ff_inputs_size)) # 600+ -> 200
+		outputs = self.out(cell_value.contiguous().view(-1, self.hidden_size_shared))
+		predicted_logsoftmax = F.log_softmax(outputs, dim=1).view(batch_size, 1, -1)
+
+		return predicted_logsoftmax, dec_hidden, [attn, attn_o1], [c_out, c_out_o1], cell_value
+
+
+	def beam_search_decoding(self, att_keys, att_vals,
+		dec_hidden=None,
+		mask_src=None, prev_c=None, beam_width=10,
+		device=torch.device('cpu'),
+		att_keys_o1=None, att_vals_o1=None, mask_src_o1=None, prev_c_o1=None):
+
+		"""
+			beam search decoding - only used for evaluation
+			Modified from - https://github.com/IBM/pytorch-seq2seq/blob/master/seq2seq/models/TopKDecoder.py
+
+			Shortcuts:
+				beam_width: k
+				batch_size: b
+				vocab_size: v
+				max_seq_len: l
+
+			Args:
+				att_keys:   [b x l x hidden_size_enc * 2 + optional key size (key_size)]
+				att_vals:   [b x l x hidden_size_enc * 2 (val_size)]
+				dec_hidden:
+							initial hidden state for dec layer [b x h_dec]
+				mask_src:
+							mask of PAD for src sequences
+				beam_width: beam width kept during searching
+
+			Returns:
+				decoder_outputs: output probabilities [(batch, 1, vocab_size)] * T
+				decoder_hidden (num_layers * num_directions, batch, hidden_size):
+										tensor containing the last hidden state of the decoder.
+				ret_dict: dictionary containing additional information as follows
+				{
+					*length* : list of integers representing lengths of output sequences,
+					*topk_length*: list of integers representing lengths of beam search sequences,
+					*sequence* : list of sequences, where each sequence is a list of predicted token IDs,
+					*topk_sequence* : list of beam search sequences, each beam is a list of token IDs,
+					*outputs* : [(batch, k, vocab_size)] * sequence_length: A list of the output probabilities (p_n)
+				}.
+		"""
+
+		# define var
+		batch_size = att_keys.size(0)
+		self.beam_width = beam_width
+		self.pos_index = Variable(torch.LongTensor(
+			range(batch_size)) * self.beam_width).view(-1, 1).to(device=device)
+
+		# initialize the input vector; att_c_value
+		input_var = Variable(torch.transpose(torch.LongTensor(
+			[[BOS] * batch_size * self.beam_width]), 0, 1)).to(device=device)
+		input_var_emb = self.embedder_dec(input_var).to(device=device)
+		prev_c = torch.FloatTensor([0]).repeat(
+			batch_size, 1, self.max_seq_len).to(device=device)
+		cell_value = torch.FloatTensor([0]).repeat(
+			batch_size, 1, self.hidden_size_shared).to(device=device)
+
+		# inflate attention keys and values (derived from encoder outputs)
+		inflated_att_keys = att_keys.repeat_interleave(self.beam_width, dim=0)
+		inflated_att_vals = att_vals.repeat_interleave(self.beam_width, dim=0)
+		inflated_mask_src = mask_src.repeat_interleave(self.beam_width, dim=0)
+		inflated_prev_c = prev_c.repeat_interleave(self.beam_width, dim=0)
+		inflated_cell_value = cell_value.repeat_interleave(self.beam_width, dim=0)
+
+		inflated_att_keys_o1 = att_keys_o1.repeat_interleave(self.beam_width, dim=0)
+		inflated_att_vals_o1 = att_vals_o1.repeat_interleave(self.beam_width, dim=0)
+		inflated_mask_src_o1 = mask_src_o1.repeat_interleave(self.beam_width, dim=0)
+		inflated_prev_c_o1 = prev_c_o1.repeat_interleave(self.beam_width, dim=0)
+
+		# inflate hidden states and others
+		# note that inflat_hidden_state might be faulty - currently using None so it's fine
+		dec_hidden = inflat_hidden_state(dec_hidden, self.beam_width)
+
+		# Initialize the scores; for the first step,
+		# ignore the inflated copies to avoid duplicate entries in the top k
+		sequence_scores = torch.Tensor(batch_size * self.beam_width, 1).to(device=device)
+		sequence_scores.fill_(-float('Inf'))
+		sequence_scores.index_fill_(0, torch.LongTensor(
+			[i * self.beam_width for i in range(0, batch_size)]).to(device=device), 0.0)
+		sequence_scores = Variable(sequence_scores)
+
+		# Store decisions for backtracking
+		stored_outputs = list()         # raw softmax scores [bk x v] * T
+		stored_scores = list()          # topk scores [bk] * T
+		stored_predecessors = list()    # preceding beam idx (from 0-bk) [bk] * T
+		stored_emitted_symbols = list() # word ids [bk] * T
+		stored_hidden = list()          #
+
+		for _ in range(self.max_seq_len):
+
+			predicted_softmax, dec_hidden, step_attn_lst, inflated_c_out_lst, inflated_cell_value = \
+				self.forward_step(inflated_att_keys, inflated_att_vals, input_var_emb,
+					inflated_cell_value, dec_hidden, inflated_mask_src, inflated_prev_c,
+					att_keys_o1=inflated_att_keys_o1, att_vals_o1=inflated_att_vals_o1, mask_src_o1=inflated_mask_src_o1, prev_c_o1=inflated_prev_c_o1)
+			inflated_prev_c, inflated_prev_c_o1 = inflated_c_out_lst[0], inflated_c_out_lst[1]
+
+			# retain output probs
+			stored_outputs.append(predicted_softmax) # [bk x v]
+
+			# To get the full sequence scores for the new candidates,
+			# add the local scores for t_i to the predecessor scores for t_(i-1)
+			sequence_scores = _inflate(sequence_scores, self.vocab_size_dec, 1)
+			sequence_scores += predicted_softmax.squeeze(1) # [bk x v]
+			scores, candidates = sequence_scores.view(
+				batch_size, -1).topk(self.beam_width, dim=1) # [b x kv] -> [b x k]
+
+			# Reshape input = (bk, 1) and sequence_scores = (bk, 1)
+			input_var = (candidates % self.vocab_size_dec).view(
+				batch_size * self.beam_width, 1).to(device=device)
+			input_var_emb = self.embedder_dec(input_var)
+			sequence_scores = scores.view(batch_size * self.beam_width, 1) #[bk x 1]
+
+			# Update fields for next timestep
+			predecessors = (candidates / self.vocab_size_dec + self.pos_index.expand_as(candidates)).\
+							view(batch_size * self.beam_width, 1)
+
+			# dec_hidden: [h_0, c_0]; with h_0 [num_layers * num_directions, batch, hidden_size]
+			if isinstance(dec_hidden, tuple):
+				dec_hidden = tuple([h.index_select(1, predecessors.squeeze()) for h in dec_hidden])
+			else:
+				dec_hidden = dec_hidden.index_select(1, predecessors.squeeze())
+			stored_scores.append(sequence_scores.clone())
+
+			# Cache results for backtracking
+			stored_predecessors.append(predecessors)
+			stored_emitted_symbols.append(input_var)
+			stored_hidden.append(dec_hidden)
+
+		# Do backtracking to return the optimal values
+		output, h_t, h_n, s, l, p = self._backtrack(stored_outputs, stored_hidden,
+			stored_predecessors, stored_emitted_symbols,
+			stored_scores, batch_size, self.hidden_size_dec, device)
+
+		# Build return objects
+		decoder_outputs = [step[:, 0, :].squeeze(1) for step in output]
+		if isinstance(h_n, tuple):
+			decoder_hidden = tuple([h[:, :, 0, :] for h in h_n])
+		else:
+			decoder_hidden = h_n[:, :, 0, :]
+		metadata = {}
+		metadata['output'] = output
+		metadata['h_t'] = h_t
+		metadata['score'] = s
+		metadata['topk_length'] = l
+		metadata['topk_sequence'] = p # [b x k x 1] * T
+		metadata['length'] = [seq_len[0] for seq_len in l]
+		metadata['sequence'] = [seq[:, 0] for seq in p]
+
+		return decoder_outputs, decoder_hidden, metadata
 
 
 def get_base_hidden(hidden):
